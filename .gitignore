@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Secrets — NEVER commit plaintext. Ciphertext is gitignored too (mirrors PawOS .cf-env convention).
+secrets.env
+secrets.env.gpg
+.env
+.cf-env
+*.decrypted
+config.env

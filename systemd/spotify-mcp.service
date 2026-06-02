@@ -1,0 +1,16 @@
+[Unit]
+Description=Spotify MCP server (FastMCP, 127.0.0.1:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/spotify_mcp
+ExecStart=%h/projects/spotify_mcp/scripts/run-server.sh
+Restart=on-failure
+RestartSec=5
+# gpg-agent lives in the user session; keep GNUPGHOME so the wrapper can reach it.
+Environment=GNUPGHOME=%h/.gnupg
+
+[Install]
+WantedBy=default.target

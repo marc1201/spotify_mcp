@@ -1,0 +1,16 @@
+[Unit]
+Description=Cloudflare tunnel for mcp.example.com (-> 127.0.0.1:8080)
+After=spotify-mcp.service network-online.target
+Wants=network-online.target
+BindsTo=spotify-mcp.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/spotify_mcp
+ExecStart=%h/projects/spotify_mcp/scripts/run-tunnel.sh
+Restart=on-failure
+RestartSec=5
+Environment=GNUPGHOME=%h/.gnupg
+
+[Install]
+WantedBy=default.target
