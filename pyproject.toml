@@ -3,6 +3,8 @@ name = "spotify-mcp"
 version = "0.1.0"
 description = "Private, full-feature Spotify MCP server (claude.ai custom connector via FastMCP + OAuthProxy)"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "fastmcp>=2.14,<3",
     "httpx[http2]>=0.27",

@@ -104,3 +104,9 @@ All advertised OAuth URLs must be `https://mcp.example.com` — never `http`, `1
 - uvicorn binds `127.0.0.1` only; the public surface is the Cloudflare-fronted HTTPS tunnel.
 - The connector is gated by Spotify login + an optional `SPOTIFY_ALLOWED_USER_IDS` allowlist (lock it
   to your own Spotify user id after the first `me` call) + Spotify dev-mode's 5-user cap.
+
+See [SECURITY.md](SECURITY.md) for the security policy and how to report issues.
+
+## License
+
+[MIT](LICENSE) © 2026 marc1201.
