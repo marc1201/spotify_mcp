@@ -4,6 +4,31 @@ A private, full-feature **Spotify MCP server** for use as a **claude.ai custom c
 the VPS, exposed at `https://mcp.example.com/mcp` via a Cloudflare Tunnel. One Spotify login both
 authenticates the connector and authorizes the Spotify API (FastMCP `OAuthProxy` wrapping Spotify).
 
+## Vibe-coding disclaimer
+
+Full disclosure: this was **vibe-coded** — designed and written end-to-end by **Claude** (Anthropic's
+Claude Code, Opus 4.8) under human direction, not hand-typed by a person. The usual caveat applies:
+**review it before you trust it** (especially the auth and secret-handling paths), and treat it as a
+personal, single-user tool rather than audited production software.
+
+It wasn't unchecked, though. The build ran behind explicit quality gates — all committed under
+`.claude/agents/`, so you can re-run them yourself:
+
+- **`security-reviewer`** — audited secret hygiene (nothing secret on argv/stdout, the gpg idiom, no
+  `set -x`) and OAuth/connector security (base_url/issuer correctness, pinned redirect URIs, PKCE,
+  127.0.0.1-only bind, SSRF guard on pagination). Its findings were applied — a path-traversal guard
+  on Spotify IDs, hashing the token-cache key, a KEY-injection guard in `set-secret.sh`, scope trimming.
+- **`qa`** — `ruff` lint + format, an import / tool-registration smoke (all 44 tools), `pytest`, and a
+  server boot-and-probe (401 + full OAuth discovery on a throwaway port).
+- **`dedup-reviewer`** — duplication review; applied the consolidations it found, kept the rest.
+
+Beyond the agents: Spotify's API behaviour (including the Feb-2026 dev-mode restrictions) and the
+FastMCP auth surface were verified against primary sources / introspected on the pinned version
+*before* coding; there are unit tests for the security-critical ID parsing and the response
+normalizers; and the OAuth handshake was verified end-to-end against the live endpoint.
+
+None of this makes AI-written code infallible — it just means it was held to a bar. Audit accordingly.
+
 ## Architecture
 
 ```
