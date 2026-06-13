@@ -458,7 +458,12 @@ class SpotifyClient:
 
     @_api
     async def remove_playlist_items(self, playlist_id: str, uris: list[str]) -> Json:
-        body = {"tracks": [{"uri": u} for u in uris]}
+        # Body shape differs by regime: classic /tracks expects {"tracks":[{"uri":...}]},
+        # restricted /items expects {"uris":[...]} (the same shape add_playlist_items uses).
+        if await self.regime() is Regime.FULL:
+            body: Json = {"tracks": [{"uri": u} for u in uris]}
+        else:
+            body = {"uris": uris}
         data = await self._json("DELETE", await self._playlist_items_url(playlist_id), json=body)
         return _snapshot(data)
 

@@ -70,3 +70,32 @@ def test_models_are_defensive():
     assert models.device({"id": "d", "name": "n", "type": "Computer"})["id"] == "d"
     # item() dispatches on type
     assert models.item({"type": "artist", "name": "A"})["name"] == "A"
+
+
+def test_remove_playlist_items_body_shape_by_regime():
+    """Regression: restricted /items DELETE needs {"uris":[...]} (not the classic {"tracks":[...]})."""
+    import asyncio
+
+    import httpx
+
+    from spotify_mcp.client import SpotifyClient
+    from spotify_mcp.regime import Regime
+
+    client = SpotifyClient(httpx.AsyncClient())
+    captured: dict = {}
+
+    async def fake_json(method, path, **kw):
+        captured.update(method=method, path=path, json=kw.get("json"))
+        return {"snapshot_id": "s"}
+
+    client._json = fake_json  # type: ignore[method-assign]
+
+    client._regime = Regime.RESTRICTED
+    asyncio.run(client.remove_playlist_items("PL", ["spotify:track:abc"]))
+    assert captured["path"].endswith("/items")
+    assert captured["json"] == {"uris": ["spotify:track:abc"]}
+
+    client._regime = Regime.FULL
+    asyncio.run(client.remove_playlist_items("PL", ["spotify:track:abc"]))
+    assert captured["path"].endswith("/tracks")
+    assert captured["json"] == {"tracks": [{"uri": "spotify:track:abc"}]}
