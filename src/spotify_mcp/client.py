@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -31,6 +32,8 @@ from .errors import (
 from .regime import Regime, RestrictedUnsupported, playlist_items_segment
 
 API = "https://api.spotify.com/v1"
+
+log = logging.getLogger("spotify_mcp")
 
 Json = dict[str, Any]
 
@@ -179,6 +182,15 @@ class SpotifyClient:
                 continue
             if resp.status_code in expected:
                 return resp
+            log.warning(
+                "spotify %s %s params=%r json=%r -> %s %s",
+                method,
+                path,
+                params,
+                json,
+                resp.status_code,
+                resp.text[:300],
+            )
             raise normalize_http_error(resp)
         raise SpotifyError("exhausted retries contacting Spotify")
 
@@ -382,7 +394,7 @@ class SpotifyClient:
     async def artist_albums(
         self, artist_id: str, include_groups: str | None = None, limit: int = 50, offset: int = 0
     ) -> list[Json | None]:
-        params = {"limit": min(50, limit), "offset": offset, "include_groups": include_groups}
+        params = {"limit": min(10, limit), "offset": offset, "include_groups": include_groups}
         data = await self._json("GET", f"/artists/{parse_id(artist_id)}/albums", params=params)
         return [models.album(x) for x in (data or {}).get("items", [])]
 
@@ -458,13 +470,15 @@ class SpotifyClient:
 
     @_api
     async def remove_playlist_items(self, playlist_id: str, uris: list[str]) -> Json:
-        # Body shape differs by regime: classic /tracks expects {"tracks":[{"uri":...}]},
-        # restricted /items expects {"uris":[...]} (the same shape add_playlist_items uses).
-        if await self.regime() is Regime.FULL:
-            body: Json = {"tracks": [{"uri": u} for u in uris]}
-        else:
-            body = {"uris": uris}
-        data = await self._json("DELETE", await self._playlist_items_url(playlist_id), json=body)
+        # The removal body's key was renamed `tracks` -> `items` in the 2026 API (confirmed against
+        # the API reference): classic /tracks uses {"tracks":[{"uri":...}]}, restricted /items uses
+        # {"items":[{"uri":...}]} — same object shape, both in the DELETE request body.
+        key = "tracks" if await self.regime() is Regime.FULL else "items"
+        data = await self._json(
+            "DELETE",
+            await self._playlist_items_url(playlist_id),
+            json={key: [{"uri": u} for u in uris]},
+        )
         return _snapshot(data)
 
     @_api
@@ -538,7 +552,7 @@ class SpotifyClient:
         if await self.regime() is Regime.FULL:
             await self._json("PUT", f"/me/{_plural(item_type)}", json={"ids": ids})
         else:
-            await self._json("PUT", "/me/library", json={"uris": uris})
+            await self._json("PUT", "/me/library", params={"uris": ",".join(uris)})
         return {"ok": True, "saved": len(uris)}
 
     @_api
@@ -547,7 +561,7 @@ class SpotifyClient:
         if await self.regime() is Regime.FULL:
             await self._json("DELETE", f"/me/{_plural(item_type)}", json={"ids": ids})
         else:
-            await self._json("DELETE", "/me/library", json={"uris": uris})
+            await self._json("DELETE", "/me/library", params={"uris": ",".join(uris)})
         return {"ok": True, "removed": len(uris)}
 
     @_api
@@ -577,7 +591,7 @@ class SpotifyClient:
         if await self.regime() is Regime.FULL:
             await self._json("PUT", "/me/following", params={"type": item_type}, json={"ids": ids})
         else:
-            await self._json("PUT", "/me/library", json={"uris": uris})
+            await self._json("PUT", "/me/library", params={"uris": ",".join(uris)})
         return {"ok": True}
 
     @_api
@@ -588,7 +602,7 @@ class SpotifyClient:
                 "DELETE", "/me/following", params={"type": item_type}, json={"ids": ids}
             )
         else:
-            await self._json("DELETE", "/me/library", json={"uris": uris})
+            await self._json("DELETE", "/me/library", params={"uris": ",".join(uris)})
         return {"ok": True}
 
     @_api
@@ -608,7 +622,7 @@ class SpotifyClient:
         if await self.regime() is Regime.FULL:
             await self._json("PUT", f"/playlists/{pid}/followers", json={"public": public})
         else:
-            await self._json("PUT", "/me/library", json={"uris": [f"spotify:playlist:{pid}"]})
+            await self._json("PUT", "/me/library", params={"uris": f"spotify:playlist:{pid}"})
         return {"ok": True}
 
     @_api
@@ -617,7 +631,7 @@ class SpotifyClient:
         if await self.regime() is Regime.FULL:
             await self._json("DELETE", f"/playlists/{pid}/followers")
         else:
-            await self._json("DELETE", "/me/library", json={"uris": [f"spotify:playlist:{pid}"]})
+            await self._json("DELETE", "/me/library", params={"uris": f"spotify:playlist:{pid}"})
         return {"ok": True}
 
     # ---- profile & personalization -----------------------------------------

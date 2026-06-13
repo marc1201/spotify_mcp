@@ -72,8 +72,9 @@ def test_models_are_defensive():
     assert models.item({"type": "artist", "name": "A"})["name"] == "A"
 
 
-def test_remove_playlist_items_body_shape_by_regime():
-    """Regression: restricted /items DELETE needs {"uris":[...]} (not the classic {"tracks":[...]})."""
+def test_remove_playlist_items_request_shape_by_regime():
+    """Regression: the remove DELETE body key is `tracks` (full /tracks) vs `items` (restricted
+    /items) — same {"uri": ...} object shape, both in the request body (confirmed vs the API ref)."""
     import asyncio
 
     import httpx
@@ -85,7 +86,8 @@ def test_remove_playlist_items_body_shape_by_regime():
     captured: dict = {}
 
     async def fake_json(method, path, **kw):
-        captured.update(method=method, path=path, json=kw.get("json"))
+        captured.clear()
+        captured.update(method=method, path=path, json=kw.get("json"), params=kw.get("params"))
         return {"snapshot_id": "s"}
 
     client._json = fake_json  # type: ignore[method-assign]
@@ -93,9 +95,47 @@ def test_remove_playlist_items_body_shape_by_regime():
     client._regime = Regime.RESTRICTED
     asyncio.run(client.remove_playlist_items("PL", ["spotify:track:abc"]))
     assert captured["path"].endswith("/items")
-    assert captured["json"] == {"uris": ["spotify:track:abc"]}
+    assert captured["json"] == {"items": [{"uri": "spotify:track:abc"}]}
+    assert captured["params"] is None
 
     client._regime = Regime.FULL
     asyncio.run(client.remove_playlist_items("PL", ["spotify:track:abc"]))
     assert captured["path"].endswith("/tracks")
     assert captured["json"] == {"tracks": [{"uri": "spotify:track:abc"}]}
+    assert captured["params"] is None
+
+
+def test_library_and_follow_use_query_uris_in_restricted():
+    """Restricted /me/library save/remove/follow pass uris as a comma-separated QUERY param
+    (not a JSON body), per the 2026 consolidated endpoints."""
+    import asyncio
+
+    import httpx
+
+    from spotify_mcp.client import SpotifyClient
+    from spotify_mcp.regime import Regime
+
+    client = SpotifyClient(httpx.AsyncClient())
+    client._regime = Regime.RESTRICTED
+    captured: dict = {}
+
+    async def fake_json(method, path, **kw):
+        captured.clear()
+        captured.update(method=method, path=path, json=kw.get("json"), params=kw.get("params"))
+        return None
+
+    client._json = fake_json  # type: ignore[method-assign]
+
+    asyncio.run(client.save_to_library("track", ["spotify:track:abc"]))
+    assert (captured["method"], captured["path"]) == ("PUT", "/me/library")
+    assert captured["json"] is None and captured["params"] == {"uris": "spotify:track:abc"}
+
+    asyncio.run(client.remove_from_library("track", ["spotify:track:abc"]))
+    assert captured["method"] == "DELETE" and captured["params"] == {"uris": "spotify:track:abc"}
+
+    asyncio.run(client.follow("artist", ["spotify:artist:xyz"]))
+    assert captured["method"] == "PUT" and captured["params"] == {"uris": "spotify:artist:xyz"}
+
+    asyncio.run(client.follow_playlist("PL"))
+    assert (captured["method"], captured["path"]) == ("PUT", "/me/library")
+    assert captured["params"] == {"uris": "spotify:playlist:PL"}
