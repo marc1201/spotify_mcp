@@ -44,6 +44,27 @@ claude.ai ──OAuth(DCR+PKCE)──▶ mcp.example.com/mcp ──OAuthProxy─
   (`get_items_batch`, `artist_top_tracks`, `get_user_profile`, `browse`) return a clear message on
   restricted apps.
 
+## Restricted dev-mode notes
+
+This app runs in Spotify's **restricted** 2026 dev-mode regime (auto-detected on the first
+authenticated call). The server routes to the consolidated endpoints and the request shapes the
+current Web API reference specifies — several of which differ non-obviously from the classic API.
+Every endpoint was audited against the 2026 reference; the verified restricted shapes are:
+
+| Operation | Restricted request |
+|---|---|
+| Add playlist items | `POST /playlists/{id}/items` — body `{"uris":[...]}` |
+| Remove playlist items | `DELETE /playlists/{id}/items` — body `{"items":[{"uri":...}]}` (key renamed from `tracks`) |
+| Reorder playlist items | `PUT /playlists/{id}/items` — body `{range_start, insert_before, range_length}` |
+| Create playlist | `POST /me/playlists` |
+| Save/remove library, follow/unfollow | `PUT`/`DELETE /me/library` — `uris` as a **comma-separated query param** (max 40), not a body |
+| Check saved / following | `GET /me/library/contains?uris=…` |
+| Search | `limit` capped at 10 |
+
+Full-access-only tools (`get_items_batch`, `artist_top_tracks`, `get_user_profile`, `browse`) return a
+clear "unavailable on restricted apps" message. The HTTP client logs `method/path/body/response` on any
+Spotify error (`journalctl --user -u spotify-mcp`), and `tests/` pins these request shapes per regime.
+
 ## One-time setup
 
 1. **Spotify app** (developer.spotify.com → your app → Settings):
