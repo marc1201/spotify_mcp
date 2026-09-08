@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 echo "Warming gpg-agent (you may be prompted for your key passphrase)…" >&2
-gpg --decrypt "$ROOT/secrets.env.gpg" >/dev/null   # output discarded; never printed
+gpg --quiet --decrypt "$ROOT/secrets.env.gpg" >/dev/null   # --quiet: no key-metadata on stderr; output discarded, never printed
 
 systemctl --user daemon-reload
 systemctl --user restart spotify-mcp.service spotify-tunnel.service
