@@ -14,6 +14,7 @@ from fastmcp.server.auth import OAuthProxy
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from . import __version__
 from .auth import SPOTIFY_SCOPES, SpotifyTokenVerifier
 from .settings import Settings, load_settings
 from .tools import register_all
@@ -61,7 +62,9 @@ def build_app(settings: Settings | None = None):
         allowed_client_redirect_uris=CLAUDE_REDIRECT_URIS,
     )
 
-    mcp = FastMCP("Spotify", instructions=INSTRUCTIONS, auth=auth)
+    # The version travels in the MCP initialize handshake; bump it with every tool-surface change
+    # so clients that cache a connector's tool list see that it changed.
+    mcp = FastMCP("Spotify", instructions=INSTRUCTIONS, auth=auth, version=__version__)
     register_all(mcp)
 
     @mcp.custom_route("/healthz", methods=["GET"])
