@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
-from . import follow, library, playback, playlists, profile, search
+from . import follow, library, playback, playlists, profile, rotation, search
 
 
 def register_all(mcp: FastMCP) -> None:
-    for module in (playback, search, playlists, library, follow, profile):
+    for module in (playback, search, playlists, library, follow, profile, rotation):
         module.register(mcp)

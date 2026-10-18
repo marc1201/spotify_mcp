@@ -56,6 +56,10 @@ def track(t: Json | None) -> Json | None:
         out["explicit"] = t["explicit"]
     if t.get("popularity") is not None:
         out["popularity"] = t["popularity"]
+    if t.get("is_playable") is not None:  # only present when a market was requested
+        out["is_playable"] = t["is_playable"]
+    if (t.get("external_ids") or {}).get("isrc"):
+        out["isrc"] = t["external_ids"]["isrc"]
     return out
 
 
@@ -88,11 +92,13 @@ def playlist(p: Json | None) -> Json | None:
     if not p:
         return None
     tracks = p.get("tracks") or p.get("items") or {}
+    owner = p.get("owner") or {}
     return {
         "name": p.get("name"),
         "id": p.get("id"),
         "uri": p.get("uri"),
-        "owner": (p.get("owner") or {}).get("display_name") or (p.get("owner") or {}).get("id"),
+        "owner": owner.get("display_name") or owner.get("id"),
+        "owner_id": owner.get("id"),
         "public": p.get("public"),
         "collaborative": p.get("collaborative"),
         "description": p.get("description"),

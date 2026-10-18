@@ -18,7 +18,7 @@ It wasn't unchecked, though. The build ran behind explicit quality gates — all
   `set -x`) and OAuth/connector security (base_url/issuer correctness, pinned redirect URIs, PKCE,
   127.0.0.1-only bind, SSRF guard on pagination). Its findings were applied — a path-traversal guard
   on Spotify IDs, hashing the token-cache key, a KEY-injection guard in `set-secret.sh`, scope trimming.
-- **`qa`** — `ruff` lint + format, an import / tool-registration smoke (all 44 tools), `pytest`, and a
+- **`qa`** — `ruff` lint + format, an import / tool-registration smoke (all 55 tools), `pytest`, and a
   server boot-and-probe (401 + full OAuth discovery on a throwaway port).
 - **`dedup-reviewer`** — duplication review; applied the consolidations it found, kept the rest.
 
@@ -38,7 +38,8 @@ claude.ai ──OAuth(DCR+PKCE)──▶ mcp.example.com/mcp ──OAuthProxy─
 ```
 
 - **Server:** Python + FastMCP (`>=2.14,<3`), uvicorn on `127.0.0.1:8080` (reachable only via the tunnel).
-- **44 tools:** playback, queue, devices, search/lookup, playlists, library, follow, profile, top items.
+- **55 tools:** playback, queue, devices, search/lookup, playlists, library, follow, profile, top items,
+  and the daily rotation (below).
 - **Regime auto-detect:** Spotify's 2026 dev-mode split (FULL vs RESTRICTED endpoint sets) is detected
   on first authenticated call; library/follow/playlist paths route automatically. FULL-only tools
   (`get_items_batch`, `artist_top_tracks`, `get_user_profile`, `browse`) return a clear message on
@@ -64,6 +65,81 @@ Every endpoint was audited against the 2026 reference; the verified restricted s
 Full-access-only tools (`get_items_batch`, `artist_top_tracks`, `get_user_profile`, `browse`) return a
 clear "unavailable on restricted apps" message. The HTTP client logs `method/path/body/response` on any
 Spotify error (`journalctl --user -u spotify-mcp`), and `tests/` pins these request shapes per regime.
+
+## Daily rotation (Closer by Candlelight Daily)
+
+A small rotation engine builds a 24-track playlist every morning from a stored song pool,
+following six rules (no repeats from the last two days, caps on recently played tracks, a rested
+minimum, one new song a day until the end of 2026 and then weekly, equal distribution) plus the
+Candlelight structure: four movements of six, at most three tracks per artist, never the same
+artist twice in a row. The spec and rule definitions live in Marc's requirements doc; the picking
+algorithm is `rotation/engine.py`, a port of the reference `rotation_v2.py`.
+
+A second rotation is a seed plus a config: `rotation_seed(rotation="wehmut", playlist_ids=[...])`, then
+`rotation_config(rotation="wehmut", track_count=12, movements=1, period_days=7, ...)`. With gaps counted
+in periods, a pool needs roughly five times the playlist length so two excluded periods never leave
+the list short.
+
+Layering: `tools/rotation.py` (thin) → `rotation/service.py` (the operations) → `rotation/store.py`
+(sqlite, `ROTATION_DB`, default `data/rotation.db`) + `rotation/engine.py` (pure selection) + the
+`SpotifyClient` for every Spotify call. `daily_tracks` is the source of truth: play counts and gaps
+are derived from it, dry runs are never stored, and a day's records are written in one transaction
+after Spotify succeeded.
+
+| Tool | Purpose |
+|---|---|
+| `rotation_status` | pool size, last run, `run_exists_today`, `new_song_due` + why, play-count spread, artists at the pool cap, `taste_brief` |
+| `library_check` | which owned playlists already hold a track (id, ISRC, or normalized title + artist) and whether it is in the pool; uses a 12-hour index |
+| `rotation_pool_add` | add a new song with a movement and a note; refuses duplicates and tracks already on an owned playlist |
+| `rotation_generate` | pick, create the dated playlist, record the run, apply retention; idempotent per date, `force` replaces, `dry_run` only picks |
+| `rotation_pool_set_active` | veto or restore a track (history kept) |
+| `rotation_pool_list`, `rotation_history` | the pool with counts; the last N runs with buckets |
+| `rotation_seed` | import from playlists, movements spread evenly over each; `reset` wipes pool and history first |
+| `rotation_pool_update`, `rotation_delete` | change a track's movement or note; delete a whole rotation (two steps: the first call returns the confirm token). Reset and delete snapshot the database first (`data/rotation.<stamp>.<op>.bak.db`) and leave the rotation's playlists on Spotify, which retention then no longer tracks |
+| `rotation_config` | read or change the shape (track_count, movements, per_movement), period_days (1 daily, 7 weekly: gap rules count in periods), taste brief, name template (`{date}`, `{dd}.{mm}.`), artist cap, retention (days), pool floor, schedule, and position rules such as first and last slot by Sade |
+
+Setup, once, from any chat with the connector: `rotation_seed` with the six volume playlist ids in
+order (Vol I first), then `rotation_pool_set_active(false)` for any track to leave out, then
+`rotation_generate(dry_run=true)` to see the first day. The scheduled task below does the rest.
+
+**Privacy.** The daily playlists come out public. SMCP sends `public: false` on create and again on
+update, but Spotify ignores the field for API-created playlists: the Web API's `public` only ever
+meant "published on the profile", the apps' real private state was never exposed to the API, and even
+the profile flag is widely reported as dropped on write (community threads since 2022, confirmed here on
+2026-10-18 with `scripts/probe-playlist-privacy.py`, a manual diagnostic that prints only status codes
+and flags). `rotation_generate` therefore reports `public` as Spotify reads it back. To make a daily
+playlist private, do it in the Spotify app; or keep one app-private playlist and refill it.
+
+The sqlite file is the only copy of the history. Copy it now and then:
+`.venv/bin/python -c "import sqlite3; sqlite3.connect('data/rotation.db').backup(sqlite3.connect('data/rotation.bak.db'))"`.
+
+### Scheduled task
+
+A claude.ai scheduled task at 06:50 Lisbon (`CRON_TZ=Europe/Lisbon 50 6 * * *`) with the SMCP
+connector. In that environment the tools are named `mcp__SMCP__<tool>`. The task reads catalog
+text it does not control, so restrict its allowed tools to `me`, `search`, `library_check` and the
+`rotation_*` tools; it needs nothing else. Prompt:
+
+```
+Daily Closer by Candlelight. Load the SMCP tools with ToolSearch first; they are named mcp__SMCP__<tool>.
+Use only these tools: me, search, library_check, rotation_status, rotation_pool_add, rotation_generate.
+
+1. Call me. If it fails, stop and report: "SMCP needs re-authorization, today's Candlelight playlist was not created."
+2. Call rotation_status with rotation "candlelight". If run_exists_today is true, stop and report that today's
+   playlist already exists.
+3. If new_song_due is true, add one new song:
+   - Pick a track that fits taste_brief exactly, in its original album version, by an artist that is not in
+     artists_at_cap. Find it with search (types ["track"]) and use the track uri from the result.
+   - Call library_check with that uri. If in_pool is true or playlists is not empty, pick a different track.
+   - Call rotation_pool_add with the uri, movement 1-4 (1 first spark, 2 drawing in, 3 deep heat, 4 afterglow),
+     a one-line note on why it fits, and actor "scheduled-task".
+   - If three candidates in a row are refused, skip the new song and say so in the report.
+4. Call rotation_generate with rotation "candlelight" and no other arguments.
+5. Report in at most four lines: the playlist name and url; the new song as "Artist - Title: note" or
+   "no new song"; relaxations, or "no relaxations"; and a last line "Needs attention: yes" only if a step
+   failed, a relaxation was logged, or no new song could be added, otherwise "Needs attention: no".
+   Plain text, no em dashes, no emojis, no tables.
+```
 
 ## One-time setup
 
