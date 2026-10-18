@@ -52,10 +52,11 @@ def register(mcp: FastMCP) -> None:
         dry_run: bool = False,
         force: bool = False,
     ) -> dict:
-        """Build the day's playlist: pick the tracks by the rotation rules, create the private dated
+        """Build the day's playlist: pick the tracks by the rotation rules, create the dated
         playlist, record the run, and unfollow daily playlists beyond retention. Returns playlist
-        id/url, the tracks in order with movement, bucket and gap, the rule report and any
-        relaxations. A second call for the same date returns the existing run unless force=true,
+        id/url, `public` as Spotify reports it (Spotify ignores the private flag for API-created
+        playlists, so it is public unless made private in the app), the tracks in order with
+        movement, bucket and gap, the rule report and any relaxations. A second call for the same date returns the existing run unless force=true,
         which replaces the playlist and that date's records. dry_run=true only picks."""
         return await get_service().generate(rotation, date, dry_run=dry_run, force=force)
 

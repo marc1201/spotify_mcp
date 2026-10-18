@@ -616,7 +616,8 @@ class RotationService:
         created = await self._client.create_playlist(name, public=False, description=description)
         pid = created["id"]
         await self._client.add_playlist_items(pid, [t["uri"] for t in tracks])
-        # Set privacy again after the fact: the create-time flag has been seen to not stick.
+        # `public: false` is sent on create and again here, but Spotify ignores it for API-created
+        # playlists (README, "Privacy"); the state it actually reports is read back below.
         await self._client.set_playlist_details(pid, public=False, description=description)
         self._store.record_run(
             rotation,
@@ -642,6 +643,12 @@ class RotationService:
         log.info(
             "rotation %s: created %s (%s), relaxations=%r", rotation, name, pid, sel.relaxations
         )
+        try:
+            readback = await self._client.get_playlist(pid)
+            is_public = readback.get("public") if readback else None
+        except ToolError as exc:
+            log.warning("rotation: could not read back %s: %s", pid, exc)
+            is_public = None
         # Now the playlist of a forced run, and any orphan of an attempt that failed after creating
         # its playlist. Only playlists this service wrote are touched: same name AND our description
         # marker, never the one just created.
@@ -660,6 +667,7 @@ class RotationService:
             **result,
             "playlist_id": pid,
             "playlist_url": f"https://open.spotify.com/playlist/{pid}",
+            "public": is_public,  # as Spotify reports it; None if the read-back failed
             "retention": retention,
         }
 

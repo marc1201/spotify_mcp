@@ -68,7 +68,7 @@ Spotify error (`journalctl --user -u spotify-mcp`), and `tests/` pins these requ
 
 ## Daily rotation (Closer by Candlelight Daily)
 
-A small rotation engine builds a private 24-track playlist every morning from a stored song pool,
+A small rotation engine builds a 24-track playlist every morning from a stored song pool,
 following six rules (no repeats from the last two days, caps on recently played tracks, a rested
 minimum, one new song a day until the end of 2026 and then weekly, equal distribution) plus the
 Candlelight structure: four movements of six, at most three tracks per artist, never the same
@@ -86,7 +86,7 @@ after Spotify succeeded.
 | `rotation_status` | pool size, last run, `run_exists_today`, `new_song_due` + why, play-count spread, artists at the pool cap, `taste_brief` |
 | `library_check` | which owned playlists already hold a track (id, ISRC, or normalized title + artist) and whether it is in the pool; uses a 12-hour index |
 | `rotation_pool_add` | add a new song with a movement and a note; refuses duplicates and tracks already on an owned playlist |
-| `rotation_generate` | pick, create the dated private playlist, record the run, apply retention; idempotent per date, `force` replaces, `dry_run` only picks |
+| `rotation_generate` | pick, create the dated playlist, record the run, apply retention; idempotent per date, `force` replaces, `dry_run` only picks |
 | `rotation_pool_set_active` | veto or restore a track (history kept) |
 | `rotation_pool_list`, `rotation_history` | the pool with counts; the last N runs with buckets |
 | `rotation_seed` | one-time import from the volume playlists, movement from position |
@@ -95,6 +95,14 @@ after Spotify succeeded.
 Setup, once, from any chat with the connector: `rotation_seed` with the six volume playlist ids in
 order (Vol I first), then `rotation_pool_set_active(false)` for any track to leave out, then
 `rotation_generate(dry_run=true)` to see the first day. The scheduled task below does the rest.
+
+**Privacy.** The daily playlists come out public. SMCP sends `public: false` on create and again on
+update, but Spotify ignores the field for API-created playlists: the Web API's `public` only ever
+meant "published on the profile", the apps' real private state was never exposed to the API, and even
+the profile flag is widely reported as dropped on write (community threads since 2022, confirmed here on
+2026-10-18 with `scripts/probe-playlist-privacy.py`, a manual diagnostic that prints only status codes
+and flags). `rotation_generate` therefore reports `public` as Spotify reads it back. To make a daily
+playlist private, do it in the Spotify app; or keep one app-private playlist and refill it.
 
 The sqlite file is the only copy of the history. Copy it now and then:
 `.venv/bin/python -c "import sqlite3; sqlite3.connect('data/rotation.db').backup(sqlite3.connect('data/rotation.bak.db'))"`.

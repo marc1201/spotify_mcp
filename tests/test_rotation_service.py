@@ -94,11 +94,12 @@ class FakeClient:
             raise ToolError("Spotify error 503: boom")
         self._n += 1
         pid = f"PL{self._n}"
+        # Like the real Spotify API for app-created playlists: the public flag is ignored.
         self.playlists[pid] = {
             "name": name,
             "owner_id": ME,
             "items": [],
-            "public": public,
+            "public": True,
             "description": description,
         }
         return {"id": pid, "name": name, "uri": f"spotify:playlist:{pid}", "public": public}
@@ -112,8 +113,19 @@ class FakeClient:
         self, playlist_id, name=None, public=None, collaborative=None, description=None
     ):
         self.calls.append(("set_playlist_details", playlist_id, public, description))
-        self.playlists[playlist_id]["public"] = public
-        return {"ok": True}
+        return {"ok": True}  # the public flag is ignored, as Spotify does
+
+    async def get_playlist(self, playlist_id, market=None):
+        self.calls.append(("get_playlist", playlist_id))
+        p = self.playlists.get(playlist_id)
+        if p is None:
+            raise ToolError("Not found (404): playlist")
+        return {
+            "id": playlist_id,
+            "name": p["name"],
+            "owner_id": p["owner_id"],
+            "public": p["public"],
+        }
 
     async def unfollow_playlist(self, playlist_id):
         self.calls.append(("unfollow_playlist", playlist_id))
@@ -251,7 +263,7 @@ def test_dry_run_is_deterministic_and_within_limits(svc):
     assert run(service.status("candlelight", "2026-11-30"))["run_exists_today"] is False
 
 
-def test_real_run_creates_private_playlist_and_records(svc):
+def test_real_run_creates_playlist_reports_visibility_and_records(svc):
     service, client, _ = svc
     res = run(service.generate("candlelight"))
     assert res["date"] == "2026-10-19"
@@ -260,7 +272,7 @@ def test_real_run_creates_private_playlist_and_records(svc):
     assert create[1] == res["playlist_name"] and create[2] is False
     assert client.names("add_playlist_items")[0][2] == [t["uri"] for t in res["tracks"]]
     assert client.names("set_playlist_details")[0][2] is False
-    assert client.playlists["PL1"]["public"] is False
+    assert res["public"] is True  # Spotify ignored the flag; the result says so
     assert res["retention"] == {"removed": [], "errors": []}
 
     client.calls.clear()
