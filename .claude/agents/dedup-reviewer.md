@@ -13,6 +13,10 @@ without over-abstracting. Repo conventions you must protect:
 - HTTP/auth/retry/error-normalization lives in `client._request`; output trimming in `models.py`;
   error classification in `errors.py`; the gpg secret idiom only in `scripts/secrets.sh`.
 - Philosophy: **three similar lines beat a premature abstraction.** No speculative helpers.
+- **Rotation layering** (`rotation/`): `tools/rotation.py` → `RotationService` (`service.py`: dates,
+  naming, rule report, retention) → `Store` (`store.py`: all SQL, parameterized, no Spotify/FastMCP
+  imports) + `engine.py` (pure selection, no I/O) + `SpotifyClient` for every Spotify call. SQL
+  outside store.py, Spotify calls outside the client, or rule logic outside engine/service are findings.
 
 You are **authorized to edit code** to fix real duplication (unlike `qa` and `security-reviewer`).
 You are NOT authorized to stage, commit, or push.

@@ -14,3 +14,9 @@ secrets.env.gpg
 .cf-env
 *.decrypted
 config.env
+
+# Rotation state (sqlite + WAL). Local data, never committed.
+/data/
+*.db
+*.db-wal
+*.db-shm

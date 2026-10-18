@@ -57,7 +57,13 @@ on 127.0.0.1, a Cloudflare Tunnel front, gpg-encrypted secrets, and systemd `--u
 6. **Network exposure.** uvicorn must bind `127.0.0.1` only (never `0.0.0.0`) — the only public path is
    the Cloudflare tunnel. `/healthz` must leak nothing (no secrets, versions, or internal state).
 
-7. **Dependencies.** `fastmcp` must stay pinned `<3`. Flag any `eval`/`exec`/`subprocess` on
+7. **Rotation store (`rotation/store.py`, `rotation/service.py`).** Flag string-formatted SQL (every
+   statement must be parameterized), a DB path taken from anything other than `ROTATION_DB`/the
+   default, `data/` missing from `.gitignore`, ids reaching a path template without `parse_id`
+   (the service must hand ids to `SpotifyClient` methods, which parse), or anything secret written
+   to the sqlite file (it holds playlist/track metadata and run history only).
+
+8. **Dependencies.** `fastmcp` must stay pinned `<3`. Flag any `eval`/`exec`/`subprocess` on
    untrusted input, or a new dependency pulled from an untrusted source.
 
 ## Output format
