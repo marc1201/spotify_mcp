@@ -83,13 +83,41 @@ def register(mcp: FastMCP) -> None:
         track with its movement, bucket and gap at pick."""
         return await get_service().history(rotation, days=days)
 
+    @mcp.tool(annotations={"destructiveHint": True})
+    async def rotation_seed(
+        playlist_ids: list[str],
+        rotation: str = "candlelight",
+        reset: bool = False,
+        confirm: str = "",
+    ) -> dict:
+        """Import the tracks of the given playlists (in volume order, Vol I first), spreading the
+        movements evenly over each playlist (24 -> 6/6/6/6, 69 -> 18/17/17/17; one movement ->
+        all 1). A rotation that does not exist yet is created from the defaults (name template
+        "<rotation> {date}", empty taste brief); tune it with rotation_config afterwards.
+        Re-running skips tracks already in the pool. reset=true wipes the pool and the run
+        history first and needs confirm=<rotation name>; the config stays, a snapshot of the
+        database is taken, and playlists on Spotify are not touched."""
+        return await get_service().seed(rotation, playlist_ids, reset=reset, confirm=confirm)
+
     @mcp.tool
-    async def rotation_seed(playlist_ids: list[str], rotation: str = "candlelight") -> dict:
-        """One-time setup: import the tracks of the given playlists (in volume order, Vol I first)
-        with movement from position (1-6, 7-12, 13-18, 19-24). A rotation that does not exist
-        yet is created from the defaults (name template "<rotation> {date}", empty taste brief);
-        tune it with rotation_config afterwards. Re-running skips tracks already in the pool."""
-        return await get_service().seed(rotation, playlist_ids)
+    async def rotation_pool_update(
+        uri: str,
+        rotation: str = "candlelight",
+        movement: int | None = None,
+        note: str | None = None,
+        actor: str = "chat",
+    ) -> dict:
+        """Change a pool track's movement and/or note. Other fields stay."""
+        return await get_service().pool_update(
+            rotation, uri, movement=movement, note=note, actor=actor
+        )
+
+    @mcp.tool(annotations={"destructiveHint": True})
+    async def rotation_delete(rotation: str, confirm: str = "") -> dict:
+        """Delete a rotation: its config, pool, run history and events. Two steps: called
+        without confirm it only reports the row counts and the exact confirm token; called with
+        that token it snapshots the database and deletes. Playlists on Spotify are left alone."""
+        return await get_service().delete(rotation, confirm=confirm)
 
     @mcp.tool
     async def rotation_config(
@@ -104,14 +132,22 @@ def register(mcp: FastMCP) -> None:
         new_song_daily_until: str | None = None,
         new_song_then_every_days: int | None = None,
         position_rules: list[dict] | None = None,
+        track_count: int | None = None,
+        movements: int | None = None,
+        per_movement: int | None = None,
+        period_days: int | None = None,
     ) -> dict:
-        """Read the rotation's config, or change the given fields (the rest stay). name_template
-        takes date tokens: {date} (2026-10-18), {dd} {mm} {yy} {yyyy}, or {date:<strftime>}; e.g.
-        "1 Intimate - Candlelight {dd}.{mm}.". position_rules pins slots to an artist already in
-        the pool, e.g. [{"position": "first", "artist": "Sade", "movements": [1, 2]},
-        {"position": "last", "artist": "Sade", "movements": [3, 4]}]; position is 1-based or
-        'first'/'last', movements (optional) are where the track may come from; pass [] to
-        clear. new_song_daily_until is YYYY-MM-DD. Changes apply from the next run."""
+        """Read the rotation's config, or change the given fields (the rest stay).
+        Shape: track_count (max 100), movements and per_movement (movements x per_movement =
+        track_count; movements=1 means no arc and the tracks' movements are ignored).
+        period_days: 1 daily, 7 weekly; every gap rule (no repeat within 2 periods, caps on
+        3-4 and 3-5 periods, rested = 8+ periods) counts in periods, while retention_days and
+        new_song_then_every_days stay in days. name_template takes date tokens: {date}
+        (2026-10-18), {dd} {mm} {yy} {yyyy}, or {date:<strftime>}. position_rules pins slots to
+        an artist already in the pool, e.g. [{"position": "first", "artist": "Sade",
+        "movements": [1, 2]}]; position is 1-based or 'first'/'last', movements (optional) are
+        where the track may come from; pass [] to clear. new_song_daily_until is YYYY-MM-DD.
+        Changes apply from the next run."""
         return await get_service().config(
             rotation,
             taste_brief=taste_brief,
@@ -124,4 +160,8 @@ def register(mcp: FastMCP) -> None:
             new_song_daily_until=new_song_daily_until,
             new_song_then_every_days=new_song_then_every_days,
             position_rules=position_rules,
+            track_count=track_count,
+            movements=movements,
+            per_movement=per_movement,
+            period_days=period_days,
         )

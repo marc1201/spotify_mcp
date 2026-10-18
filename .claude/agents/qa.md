@@ -25,7 +25,7 @@ From the repo root (`~/projects/spotify_mcp`), in this order. **Stop at the firs
    print("tools:", len(asyncio.run(m.get_tools())))
    PY
    ```
-   Expect ~53 tools and no traceback.
+   Expect ~55 tools and no traceback.
 4. `.venv/bin/pytest -q` — only if `tests/` contains test files.
 5. **Boot-and-probe** — only when server/auth/client code changed. Start the server with DUMMY env
    (no real secrets), check the OAuth surface, then kill it:

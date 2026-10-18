@@ -41,9 +41,11 @@ class Selection(NamedTuple):
     pinned: dict[int, str]  # final 1-based position -> track id placed there by a position rule
 
 
-def gap_of(track: Track, today: dt.date) -> int:
+def gap_of(track: Track, today: dt.date, period_days: int = 1) -> int:
+    """Whole periods since the track's last playlist (days for a daily rotation, weeks for a
+    weekly one); never played counts as rested."""
     last = track.get("last")
-    return NEVER_PLAYED if last is None else (today - last).days
+    return NEVER_PLAYED if last is None else (today - last).days // period_days
 
 
 def bucket_of(gap: int) -> str:
@@ -69,7 +71,8 @@ def select(
     position_rules: Iterable[dict[str, Any]] = (),
 ) -> Selection:
     """Pick cfg['size'] tracks for `today`. cfg keys: size, movements (default 4), per_movement,
-    cap_3_4, cap_3_5, min_fresh, artist_cap, lookahead_margin. `rng` must be seeded by the caller with the rotation
+    period_days (default 1: gaps count in days; 7: in weeks), cap_3_4, cap_3_5, min_fresh,
+    artist_cap, lookahead_margin. `rng` must be seeded by the caller with the rotation
     and the date so that a dry run and the real run agree. Each position rule is a dict
     {position: 1-based slot, artist: primary artist, movements?: the movements its track may come
     from (default: the slot's own)}; its track is reserved before anything else, least played
@@ -77,18 +80,19 @@ def select(
     pool = sorted(pool, key=lambda s: s["id"])
     size, per_movement = cfg["size"], cfg["per_movement"]
     n_movements = cfg.get("movements", 4)
+    period = cfg.get("period_days", 1)
     cap_34, cap_345, min_fresh = cfg["cap_3_4"], cfg["cap_3_5"], cfg["min_fresh"]
     artist_cap, margin = cfg["artist_cap"], cfg["lookahead_margin"]
 
     def bucket(s: Track) -> str:
-        return bucket_of(gap_of(s, today))
+        return bucket_of(gap_of(s, today, period))
 
     elig = [s for s in pool if s["active"] and bucket(s) != "X"]
     jitter = {s["id"]: rng.random() for s in elig}
 
     def key(s: Track) -> tuple[int, int, float]:
         # Priority: least played, then longest gap, then the seeded random tiebreak.
-        return (s["count"], -min(gap_of(s, today), 999), jitter[s["id"]])
+        return (s["count"], -min(gap_of(s, today, period), 999), jitter[s["id"]])
 
     supply = sum(1 for s in elig if bucket(s) in ("C7", "F"))  # tomorrow's rested candidates
     chosen: list[Track] = []

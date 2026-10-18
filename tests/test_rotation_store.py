@@ -109,10 +109,19 @@ def test_retention_keeps_the_newest_runs():
             },
             [],
         )
-    beyond = s.runs_beyond_retention("x", keep=7)
+    beyond = s.runs_beyond_retention("x", keep_from="2026-11-02")
     assert [r["playlist_id"] for r in beyond] == ["P1"]
     s.mark_playlist_removed("x", "2026-11-01")
-    assert s.runs_beyond_retention("x", keep=7) == []
+    assert s.runs_beyond_retention("x", keep_from="2026-11-02") == []
+    # the newest run is never a candidate, however old the cut-off makes it
+    assert [r["playlist_id"] for r in s.runs_beyond_retention("x", keep_from="2099-01-01")] == [
+        "P2",
+        "P3",
+        "P4",
+        "P5",
+        "P6",
+        "P7",
+    ]
     assert s.last_run("x")["run_date"] == "2026-11-08"
     assert [r["run_date"] for r in s.runs_since("x", "2026-11-07")] == ["2026-11-08", "2026-11-07"]
 

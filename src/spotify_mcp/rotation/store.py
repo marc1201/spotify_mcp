@@ -98,6 +98,7 @@ def _now() -> str:
 
 class Store:
     def __init__(self, path: str = ":memory:"):
+        self._path = path
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(path, check_same_thread=False)
@@ -107,7 +108,17 @@ class Store:
             self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
 
-    # ---- rotations ----------------------------------------------------------
+    def snapshot(self, label: str) -> str | None:
+        """Copy the whole database next to itself (rotation.<utc stamp>.<label>.bak.db) before a
+        destructive operation. None for an in-memory store."""
+        if self._path == ":memory:":
+            return None
+        src = Path(self._path)
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        dest = src.with_name(f"{src.stem}.{stamp}.{label}.bak.db")
+        self._db.execute("VACUUM INTO ?", (str(dest),))
+        os.chmod(dest, 0o600)
+        return str(dest)
 
     def get_config(self, rotation_id: str) -> dict[str, Any] | None:
         row = self._db.execute("SELECT config FROM rotations WHERE id=?", (rotation_id,)).fetchone()
@@ -154,32 +165,117 @@ class Store:
         ).fetchone()
         return self._pool_row(r) if r else None
 
+    @staticmethod
+    def _pool_params(rotation_id: str, row: Row) -> tuple[Any, ...]:
+        return (
+            rotation_id,
+            row["track_id"],
+            row["uri"],
+            row["title"],
+            json.dumps(row["artists"]),
+            row["primary_artist"],
+            row.get("isrc"),
+            row.get("duration_ms"),
+            row["movement"],
+            row["src_position"],
+            row["source"],
+            row["added_on"],
+            row.get("debut_on"),
+            1 if row.get("active", True) else 0,
+            row.get("count_offset", 0),
+            row.get("note"),
+            row["title_key"],
+        )
+
+    _POOL_INSERT = (
+        "INSERT INTO pool (rotation_id, track_id, uri, title, artists, primary_artist, isrc, "
+        "duration_ms, movement, src_position, source, added_on, debut_on, active, count_offset, "
+        "note, title_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    )
+    _EVENT_INSERT = (
+        "INSERT INTO pool_events (rotation_id, track_id, event, at, actor, reason) "
+        "VALUES (?,?,?,?,?,?)"
+    )
+
     def add_pool_track(self, rotation_id: str, row: Row) -> None:
         with self._db:
-            self._db.execute(
-                "INSERT INTO pool (rotation_id, track_id, uri, title, artists, primary_artist, isrc, "
-                "duration_ms, movement, src_position, source, added_on, debut_on, active, "
-                "count_offset, note, title_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    rotation_id,
-                    row["track_id"],
-                    row["uri"],
-                    row["title"],
-                    json.dumps(row["artists"]),
-                    row["primary_artist"],
-                    row.get("isrc"),
-                    row.get("duration_ms"),
-                    row["movement"],
-                    row["src_position"],
-                    row["source"],
-                    row["added_on"],
-                    row.get("debut_on"),
-                    1 if row.get("active", True) else 0,
-                    row.get("count_offset", 0),
-                    row.get("note"),
-                    row["title_key"],
-                ),
+            self._db.execute(self._POOL_INSERT, self._pool_params(rotation_id, row))
+
+    def add_pool_tracks(
+        self,
+        rotation_id: str,
+        rows: list[Row],
+        events: list[tuple[str, str, str, str | None]],
+        clear: bool = False,
+    ) -> dict[str, int]:
+        """Insert many pool rows and their (track_id, event, actor, reason) events in ONE
+        transaction, optionally wiping the rotation's pool and history first, so a failure
+        half-way leaves the previous state untouched. Returns the rows cleared."""
+        now = _now()
+        with self._db:
+            cleared = self._clear(rotation_id) if clear else {}
+            self._db.executemany(
+                self._POOL_INSERT, [self._pool_params(rotation_id, r) for r in rows]
             )
+            self._db.executemany(
+                self._EVENT_INSERT, [(rotation_id, t, e, now, a, r) for t, e, a, r in events]
+            )
+        return cleared
+
+    def update_pool_track(self, rotation_id: str, track_id: str, changes: Row) -> None:
+        """Change a track's movement and/or note."""
+        sets = {"movement": "movement=?", "note": "note=?"}
+        unknown = set(changes) - set(sets)
+        if unknown:
+            raise ValueError(f"not updatable: {sorted(unknown)}")
+        if not changes:
+            return
+        with self._db:
+            self._db.execute(
+                "UPDATE pool SET "
+                + ", ".join(sets[k] for k in changes)
+                + " WHERE rotation_id=? AND track_id=?",
+                (*changes.values(), rotation_id, track_id),
+            )
+
+    def _clear(self, rotation_id: str) -> dict[str, int]:
+        """Delete a rotation's pool, runs, tracks and events inside the caller's transaction."""
+        return {
+            "daily_tracks": self._db.execute(
+                "DELETE FROM daily_tracks WHERE rotation_id=?", (rotation_id,)
+            ).rowcount,
+            "daily_runs": self._db.execute(
+                "DELETE FROM daily_runs WHERE rotation_id=?", (rotation_id,)
+            ).rowcount,
+            "pool_events": self._db.execute(
+                "DELETE FROM pool_events WHERE rotation_id=?", (rotation_id,)
+            ).rowcount,
+            "pool": self._db.execute(
+                "DELETE FROM pool WHERE rotation_id=?", (rotation_id,)
+            ).rowcount,
+        }
+
+    def clear_rotation_data(self, rotation_id: str) -> dict[str, int]:
+        """Delete a rotation's pool, runs, tracks and events (not its config). Returns row counts."""
+        with self._db:
+            return self._clear(rotation_id)
+
+    def delete_rotation(self, rotation_id: str) -> dict[str, int]:
+        """Remove a rotation entirely, in one transaction."""
+        with self._db:
+            counts = self._clear(rotation_id)
+            self._db.execute("DELETE FROM rotations WHERE id=?", (rotation_id,))
+        return counts
+
+    def counts(self, rotation_id: str) -> dict[str, int]:
+        return {
+            "pool": self._db.execute(
+                "SELECT COUNT(*) FROM pool WHERE rotation_id=?", (rotation_id,)
+            ).fetchone()[0],
+            "daily_runs": self._db.execute(
+                "SELECT COUNT(*) FROM daily_runs WHERE rotation_id=?", (rotation_id,)
+            ).fetchone()[0],
+        }
 
     def set_active(self, rotation_id: str, track_id: str, active: bool) -> None:
         with self._db:
@@ -193,9 +289,7 @@ class Store:
     ) -> None:
         with self._db:
             self._db.execute(
-                "INSERT INTO pool_events (rotation_id, track_id, event, at, actor, reason) "
-                "VALUES (?,?,?,?,?,?)",
-                (rotation_id, track_id, event, _now(), actor, reason),
+                self._EVENT_INSERT, (rotation_id, track_id, event, _now(), actor, reason)
             )
 
     def last_new_song_date(self, rotation_id: str) -> str | None:
@@ -309,13 +403,13 @@ class Store:
                 "DELETE FROM daily_runs WHERE rotation_id=? AND run_date=?", (rotation_id, run_date)
             )
 
-    def runs_beyond_retention(self, rotation_id: str, keep: int) -> list[Row]:
-        """Runs whose playlist is still on Spotify but is not among the newest `keep` runs."""
+    def runs_beyond_retention(self, rotation_id: str, keep_from: str) -> list[Row]:
+        """Runs dated before `keep_from` whose playlist is still on Spotify, never the newest run."""
         rows = self._db.execute(
             "SELECT * FROM daily_runs WHERE rotation_id=? AND playlist_removed_at IS NULL "
-            "AND run_date NOT IN (SELECT run_date FROM daily_runs WHERE rotation_id=? "
-            "ORDER BY run_date DESC LIMIT ?) ORDER BY run_date",
-            (rotation_id, rotation_id, keep),
+            "AND run_date<? AND run_date<(SELECT MAX(run_date) FROM daily_runs WHERE rotation_id=?) "
+            "ORDER BY run_date",
+            (rotation_id, keep_from, rotation_id),
         ).fetchall()
         return [self._run_row(r) for r in rows]
 

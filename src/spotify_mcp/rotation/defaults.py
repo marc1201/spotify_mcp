@@ -9,8 +9,9 @@ from typing import Any
 
 BASE: dict[str, Any] = {
     "track_count": 24,
-    "movements": 4,
+    "movements": 4,  # 1 = no arc: per_movement is the whole list and track movements are ignored
     "per_movement": 6,
+    "period_days": 1,  # 1 = daily, 7 = weekly; every gap rule counts in periods
     "cap_3_4_pct": 20,  # R2: at most this share with gap 3-4
     "cap_3_5_pct": 50,  # R3: at most this share with gap 3-5
     "min_fresh_pct": 20,  # R4: at least this share rested (gap 8+ or never played)
@@ -72,4 +73,8 @@ EDITABLE: tuple[str, ...] = (
     "new_song_daily_until",
     "new_song_then_every_days",
     "position_rules",
+    "track_count",
+    "movements",
+    "per_movement",
+    "period_days",
 )

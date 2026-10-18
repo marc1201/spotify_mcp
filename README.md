@@ -18,7 +18,7 @@ It wasn't unchecked, though. The build ran behind explicit quality gates — all
   `set -x`) and OAuth/connector security (base_url/issuer correctness, pinned redirect URIs, PKCE,
   127.0.0.1-only bind, SSRF guard on pagination). Its findings were applied — a path-traversal guard
   on Spotify IDs, hashing the token-cache key, a KEY-injection guard in `set-secret.sh`, scope trimming.
-- **`qa`** — `ruff` lint + format, an import / tool-registration smoke (all 53 tools), `pytest`, and a
+- **`qa`** — `ruff` lint + format, an import / tool-registration smoke (all 55 tools), `pytest`, and a
   server boot-and-probe (401 + full OAuth discovery on a throwaway port).
 - **`dedup-reviewer`** — duplication review; applied the consolidations it found, kept the rest.
 
@@ -38,7 +38,7 @@ claude.ai ──OAuth(DCR+PKCE)──▶ mcp.example.com/mcp ──OAuthProxy─
 ```
 
 - **Server:** Python + FastMCP (`>=2.14,<3`), uvicorn on `127.0.0.1:8080` (reachable only via the tunnel).
-- **53 tools:** playback, queue, devices, search/lookup, playlists, library, follow, profile, top items,
+- **55 tools:** playback, queue, devices, search/lookup, playlists, library, follow, profile, top items,
   and the daily rotation (below).
 - **Regime auto-detect:** Spotify's 2026 dev-mode split (FULL vs RESTRICTED endpoint sets) is detected
   on first authenticated call; library/follow/playlist paths route automatically. FULL-only tools
@@ -75,6 +75,11 @@ Candlelight structure: four movements of six, at most three tracks per artist, n
 artist twice in a row. The spec and rule definitions live in Marc's requirements doc; the picking
 algorithm is `rotation/engine.py`, a port of the reference `rotation_v2.py`.
 
+A second rotation is a seed plus a config: `rotation_seed(rotation="wehmut", playlist_ids=[...])`, then
+`rotation_config(rotation="wehmut", track_count=12, movements=1, period_days=7, ...)`. With gaps counted
+in periods, a pool needs roughly five times the playlist length so two excluded periods never leave
+the list short.
+
 Layering: `tools/rotation.py` (thin) → `rotation/service.py` (the operations) → `rotation/store.py`
 (sqlite, `ROTATION_DB`, default `data/rotation.db`) + `rotation/engine.py` (pure selection) + the
 `SpotifyClient` for every Spotify call. `daily_tracks` is the source of truth: play counts and gaps
@@ -89,8 +94,9 @@ after Spotify succeeded.
 | `rotation_generate` | pick, create the dated playlist, record the run, apply retention; idempotent per date, `force` replaces, `dry_run` only picks |
 | `rotation_pool_set_active` | veto or restore a track (history kept) |
 | `rotation_pool_list`, `rotation_history` | the pool with counts; the last N runs with buckets |
-| `rotation_seed` | one-time import from the volume playlists, movement from position |
-| `rotation_config` | read or change taste brief, name template (`{date}`, `{dd}.{mm}.`), artist cap, retention, pool floor, schedule, and position rules such as first and last slot by Sade |
+| `rotation_seed` | import from playlists, movements spread evenly over each; `reset` wipes pool and history first |
+| `rotation_pool_update`, `rotation_delete` | change a track's movement or note; delete a whole rotation (two steps: the first call returns the confirm token). Reset and delete snapshot the database first (`data/rotation.<stamp>.<op>.bak.db`) and leave the rotation's playlists on Spotify, which retention then no longer tracks |
+| `rotation_config` | read or change the shape (track_count, movements, per_movement), period_days (1 daily, 7 weekly: gap rules count in periods), taste brief, name template (`{date}`, `{dd}.{mm}.`), artist cap, retention (days), pool floor, schedule, and position rules such as first and last slot by Sade |
 
 Setup, once, from any chat with the connector: `rotation_seed` with the six volume playlist ids in
 order (Vol I first), then `rotation_pool_set_active(false)` for any track to leave out, then

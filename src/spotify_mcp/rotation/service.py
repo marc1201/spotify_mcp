@@ -44,6 +44,12 @@ TASTE_BRIEF_MAX = 4000
 NAME_TEMPLATE_MAX = 100
 LIBRARY_CHECK_MAX = 25
 HISTORY_DAYS_MAX = 365
+TRACK_COUNT_MAX = 100  # one add-items call
+PERIOD_DAYS_MAX = 31
+RETENTION_DAYS_MAX = 366
+NEW_SONG_EVERY_DAYS_MAX = 366
+POOL_FLOOR_MAX = 5000
+ROTATION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 DATE_TOKENS = re.compile(
     r"\{(date|dd|mm|yy|yyyy)(?::([^{}]+))?\}"
 )  # {date}, {dd}.{mm}., {date:%d.%m.}
@@ -65,16 +71,32 @@ def norm_key(title: str, artist: str) -> str:
 def engine_config(cfg: Json) -> dict[str, int]:
     """Percent rules -> counts for the engine. Caps round down, minimums round up."""
     n = cfg["track_count"]
+    single = cfg["movements"] <= 1
     return {
         "size": n,
-        "movements": cfg["movements"],
-        "per_movement": cfg["per_movement"],
+        "movements": 1 if single else cfg["movements"],
+        "per_movement": n if single else cfg["per_movement"],
+        "period_days": cfg["period_days"],
         "cap_3_4": cfg["cap_3_4_pct"] * n // 100,
         "cap_3_5": cfg["cap_3_5_pct"] * n // 100,
         "min_fresh": -(-cfg["min_fresh_pct"] * n // 100),
         "artist_cap": cfg["artist_cap"],
         "lookahead_margin": cfg["lookahead_margin"],
     }
+
+
+def movement_for(position: int, length: int, movements: int) -> int:
+    """Spread a playlist of `length` tracks evenly over the movements (the first ones take the
+    remainder): 24 -> 6/6/6/6, 23 -> 6/6/6/5, 69 -> 18/17/17/17. One movement -> always 1."""
+    if movements <= 1:
+        return 1
+    base, extra = divmod(length, movements)
+    bound = 0
+    for m in range(1, movements + 1):
+        bound += base + (1 if m <= extra else 0)
+        if position <= bound:
+            return m
+    return movements
 
 
 def _boundary(fn):
@@ -234,12 +256,12 @@ class RotationService:
         return out
 
     @staticmethod
-    def _engine_track(row: Json) -> engine.Track:
+    def _engine_track(row: Json, movements: int) -> engine.Track:
         last = row["last_played"]
         return {
             "id": row["track_id"],
             "artist": row["primary_artist"],
-            "move": row["movement"],
+            "move": 1 if movements <= 1 else min(row["movement"], movements),
             "src_pos": row["src_position"],
             "count": row["play_count"],
             "last": dt.date.fromisoformat(last) if last else None,
@@ -387,9 +409,11 @@ class RotationService:
             "relaxations": run["relaxations"],
         }
 
-    async def _apply_retention(self, rotation: str, cfg: Json) -> Json:
+    async def _apply_retention(self, rotation: str, cfg: Json, today: dt.date) -> Json:
+        """Unfollow daily playlists older than retention_days (the newest run is always kept)."""
+        keep_from = (today - dt.timedelta(days=max(1, cfg["retention_days"]) - 1)).isoformat()
         removed, errors = [], []
-        for run in self._store.runs_beyond_retention(rotation, cfg["retention_days"]):
+        for run in self._store.runs_beyond_retention(rotation, keep_from):
             err = await self._unfollow_quietly(run["playlist_id"], f"retention {run['run_date']}")
             if err and "404" not in err:  # already gone counts as removed
                 errors.append({"date": run["run_date"], "error": err})
@@ -397,8 +421,6 @@ class RotationService:
             self._store.mark_playlist_removed(rotation, run["run_date"])
             removed.append(run["playlist_name"])
         return {"removed": removed, "errors": errors}
-
-    # ---- tools (in the order the morning run uses them) ---------------------
 
     @_boundary
     async def status(self, rotation: str, date: str | None = None) -> Json:
@@ -542,17 +564,23 @@ class RotationService:
             raise ToolError("the pool is empty: run rotation_seed first")
         debut_ids = {r["track_id"] for r in pool if r["debut_on"] == d}
         ecfg = engine_config(cfg)
+        period = cfg["period_days"]
         rng = random.Random(f"{rotation}:{d}")  # same seed => dry run and real run agree
         rules = cfg.get("position_rules") or []
         sel = engine.select(
-            [self._engine_track(r) for r in pool], day, rng, ecfg, debut_ids, position_rules=rules
+            [self._engine_track(r, cfg["movements"]) for r in pool],
+            day,
+            rng,
+            ecfg,
+            debut_ids,
+            position_rules=rules,
         )
 
         by_id = {r["track_id"]: r for r in pool}
         tracks = []
         for pos, t in enumerate(sel.tracks, 1):
             row = by_id[t["id"]]
-            gap = engine.gap_of(t, day)
+            gap = engine.gap_of(t, day, period)
             bucket = engine.bucket_of(gap)
             tracks.append(
                 {
@@ -571,6 +599,7 @@ class RotationService:
         last_new = self._store.last_new_song_date(rotation)
         report = {
             "date": d,
+            "period_days": period,
             "tracks": len(tracks),
             "R1_gap_1_2": sum(1 for t in tracks if t["gap"] is not None and t["gap"] <= 2),
             "R2_gap_3_4": {"value": sel.report["R2_gap_3_4"], "max": ecfg["cap_3_4"]},
@@ -662,7 +691,11 @@ class RotationService:
                 continue
             if (pl.get("description") or "").startswith(marker):
                 await self._unfollow_quietly(pl["id"], "orphan from an earlier attempt")
-        retention = await self._apply_retention(rotation, cfg)
+        try:
+            retention = await self._apply_retention(rotation, cfg, today)
+        except Exception as exc:  # the run already succeeded; retention must not undo that
+            log.warning("rotation %s: retention failed: %s", rotation, exc)
+            retention = {"removed": [], "errors": [{"error": f"retention failed: {exc}"}]}
         return {
             **result,
             "playlist_id": pid,
@@ -759,49 +792,90 @@ class RotationService:
         return out
 
     @_boundary
-    async def seed(self, rotation: str, playlist_ids: list[str], actor: str = "chat") -> Json:
+    async def seed(
+        self,
+        rotation: str,
+        playlist_ids: list[str],
+        actor: str = "chat",
+        reset: bool = False,
+        confirm: str = "",
+    ) -> Json:
         async with self._lock(rotation):
             actor = self._actor(actor)
+            if not ROTATION_RE.match(rotation):
+                raise ToolError("rotation must be 1-32 characters of a-z, 0-9, '-' or '_'")
+            if not playlist_ids:
+                raise ToolError("pass at least one playlist id")
+            if reset and confirm != rotation:
+                raise ToolError(
+                    f"reset wipes the pool and the run history of {rotation!r}: pass confirm={rotation!r}"
+                )
             if self._store.get_config(rotation) is None:
                 # A new rotation needs no code: it starts from BASE (or its named defaults) and
                 # is tuned afterwards with rotation_config.
                 self._store.put_config(rotation, dict(defaults.config_for(rotation)))
             cfg = self._cfg(rotation)
+            # Fetch everything before touching the store, so a bad id or a Spotify error changes nothing.
+            fetched = [
+                (
+                    f"Vol {ROMAN[i]}" if i < len(ROMAN) else f"playlist {i + 1}",
+                    await self._all_playlist_items(pid),
+                )
+                for i, pid in enumerate(playlist_ids)
+            ]
             today = self._today(cfg).isoformat()
-            active = self._pool_view(rotation, before=None, active_only=True)
+            active = [] if reset else self._pool_view(rotation, before=None, active_only=True)
             offset = min((r["play_count"] for r in active), default=0)
-            imported = 0
+            seen_ids: set[str] = set()
+            seen_isrcs: set[str] = set()
+            seen_keys: set[str] = set()
+            rows: list[Json] = []
+            events: list[tuple[str, str, str, str | None]] = []
             skipped: list[Json] = []
-            for i, pid in enumerate(playlist_ids):
-                source = f"Vol {ROMAN[i]}" if i < len(ROMAN) else f"playlist {i + 1}"
-                for pos, item in enumerate(await self._all_playlist_items(pid), 1):
+            for source, items in fetched:
+                for pos, item in enumerate(items, 1):
                     t = item.get("item") or {}
                     if not t.get("id") or not t.get("artists"):
                         skipped.append({"source": source, "position": pos, "reason": "unavailable"})
                         continue
                     key = norm_key(t["name"], t["artists"][0])
-                    dup = self._store.pool_match(rotation, t["id"], t.get("isrc"), key)
-                    if dup:
+                    isrc = t.get("isrc")
+                    dup = None if reset else self._store.pool_match(rotation, t["id"], isrc, key)
+                    where = (
+                        dup["source"]
+                        if dup
+                        else (
+                            "this import"
+                            if t["id"] in seen_ids
+                            or key in seen_keys
+                            or (isrc and isrc in seen_isrcs)
+                            else None
+                        )
+                    )
+                    if where:
                         skipped.append(
                             {
                                 "source": source,
                                 "position": pos,
                                 "title": t["name"],
-                                "reason": f"already in the pool from {dup['source']}",
+                                "reason": f"already in the pool from {where}",
                             }
                         )
                         continue
-                    self._store.add_pool_track(
-                        rotation,
+                    seen_ids.add(t["id"])
+                    seen_keys.add(key)
+                    if isrc:
+                        seen_isrcs.add(isrc)
+                    rows.append(
                         {
                             "track_id": t["id"],
                             "uri": t["uri"],
                             "title": t["name"],
                             "artists": t["artists"],
                             "primary_artist": t["artists"][0],
-                            "isrc": t.get("isrc"),
+                            "isrc": isrc,
                             "duration_ms": t.get("duration_ms"),
-                            "movement": min(cfg["movements"], (pos - 1) // cfg["per_movement"] + 1),
+                            "movement": movement_for(pos, len(items), cfg["movements"]),
                             "src_position": pos,
                             "source": source,
                             "added_on": today,
@@ -810,19 +884,86 @@ class RotationService:
                             "count_offset": offset,
                             "note": None,
                             "title_key": key,
-                        },
+                        }
                     )
-                    self._store.add_event(
-                        rotation, t["id"], "added", actor, f"seeded from {source}"
-                    )
-                    imported += 1
+                    events.append((t["id"], "added", actor, f"seeded from {source}"))
+            snapshot = self._store.snapshot("reset") if reset else None
+            cleared = self._store.add_pool_tracks(rotation, rows, events, clear=reset)
             pool = self._store.pool(rotation)
-            log.info("rotation %s: seeded %d tracks (%d skipped)", rotation, imported, len(skipped))
-            return {
-                "imported": imported,
+            log.info(
+                "rotation %s: seeded %d tracks (%d skipped)", rotation, len(rows), len(skipped)
+            )
+            out = {
+                "imported": len(rows),
                 "skipped": skipped,
                 "pool_size": len(pool),
                 "by_movement": dict(sorted(Counter(r["movement"] for r in pool).items())),
+            }
+            if reset:
+                out["reset"] = cleared
+                out["snapshot"] = snapshot
+            return out
+
+    @_boundary
+    async def pool_update(
+        self,
+        rotation: str,
+        uri: str,
+        movement: int | None = None,
+        note: str | None = None,
+        actor: str = "chat",
+    ) -> Json:
+        async with self._lock(rotation):
+            cfg = self._cfg(rotation)
+            actor = self._actor(actor)
+            tid = parse_id(uri)
+            row = self._store.pool_track(rotation, tid)
+            if row is None:
+                raise ToolError(f"{uri} is not in the {rotation} pool")
+            changes: Json = {}
+            if movement is not None:
+                if not 1 <= movement <= cfg["movements"]:
+                    raise ToolError(f"movement must be between 1 and {cfg['movements']}")
+                changes["movement"] = movement
+            if note is not None:
+                changes["note"] = self._text(note, "note", NOTE_MAX) or None
+            if not changes:
+                return {**row, "changed": []}
+            self._store.update_pool_track(rotation, tid, changes)
+            what = ", ".join(f"{k}={v!r}" for k, v in changes.items())[:NOTE_MAX]
+            self._store.add_event(rotation, tid, "updated", actor, what)
+            return {**self._store.pool_track(rotation, tid), "changed": sorted(changes)}
+
+    @_boundary
+    async def delete(self, rotation: str, confirm: str = "") -> Json:
+        """Two steps: without confirm, report what would go and the exact token to pass; with
+        the matching token, snapshot the database and delete the rotation."""
+        async with self._lock(rotation):
+            if self._store.get_config(rotation) is None:
+                raise ToolError(f"rotation {rotation!r} does not exist")
+            counts = self._store.counts(rotation)
+            token = f"{rotation}:{counts['pool']}:{counts['daily_runs']}"
+            if not confirm:
+                return {
+                    "deleted": False,
+                    "rotation": rotation,
+                    "rows": counts,
+                    "confirm": token,
+                    "note": "call again with this exact confirm to delete; playlists on Spotify stay",
+                }
+            if confirm != token:
+                raise ToolError(
+                    "confirm does not match; call without confirm to get the current token"
+                )
+            snapshot = self._store.snapshot("delete")
+            rows = self._store.delete_rotation(rotation)
+            log.info("rotation %s: deleted %r", rotation, rows)
+            return {
+                "deleted": True,
+                "rotation": rotation,
+                "rows": rows,
+                "snapshot": snapshot,
+                "note": "playlists on Spotify were not touched",
             }
 
     @_boundary
@@ -833,11 +974,29 @@ class RotationService:
             unknown = sorted(set(changes) - set(defaults.EDITABLE))
             if unknown:
                 raise ToolError(f"not editable: {', '.join(unknown)}")
-            for key in ("artist_cap", "max_pool_tracks_per_artist", "retention_days", "pool_floor"):
-                if key in changes and (not isinstance(changes[key], int) or changes[key] < 1):
+            for key in (
+                "artist_cap",
+                "max_pool_tracks_per_artist",
+                "retention_days",
+                "pool_floor",
+                "new_song_then_every_days",
+                "track_count",
+                "movements",
+                "per_movement",
+                "period_days",
+            ):
+                v = changes.get(key)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
                     raise ToolError(f"{key} must be a positive integer")
-            if "new_song_then_every_days" in changes and changes["new_song_then_every_days"] < 1:
-                raise ToolError("new_song_then_every_days must be a positive integer")
+            for key, cap in (
+                ("track_count", TRACK_COUNT_MAX),
+                ("period_days", PERIOD_DAYS_MAX),
+                ("retention_days", RETENTION_DAYS_MAX),
+                ("new_song_then_every_days", NEW_SONG_EVERY_DAYS_MAX),
+                ("pool_floor", POOL_FLOOR_MAX),
+            ):
+                if key in changes and changes[key] > cap:
+                    raise ToolError(f"{key} must be at most {cap}")
             if "lookahead_margin" in changes and changes["lookahead_margin"] < 0:
                 raise ToolError("lookahead_margin must be 0 or more")
             if "taste_brief" in changes:
@@ -848,12 +1007,43 @@ class RotationService:
                     raise ToolError("taste_brief must not be empty")
             if "name_template" in changes:
                 changes["name_template"] = self._validate_name_template(changes["name_template"])
-            if "position_rules" in changes:
-                changes["position_rules"] = self._validate_position_rules(
-                    cfg, rotation, changes["position_rules"]
-                )
             if "new_song_daily_until" in changes:
                 self._date(cfg, str(changes["new_song_daily_until"]))
+            merged = {**cfg, **changes}
+            # Shape: one movement means no arc and per_movement is the whole list; otherwise the
+            # movements must tile the list exactly.
+            if merged["movements"] <= 1:
+                if merged["per_movement"] != merged["track_count"]:
+                    changes["per_movement"] = merged["per_movement"] = merged["track_count"]
+            elif merged["movements"] * merged["per_movement"] != merged["track_count"]:
+                raise ToolError(
+                    f"movements x per_movement must equal track_count "
+                    f"({merged['movements']} x {merged['per_movement']} != {merged['track_count']})"
+                )
+            if "period_days" in changes and "retention_days" not in changes:
+                if merged["retention_days"] < 2 * merged["period_days"]:
+                    raise ToolError(
+                        f"retention_days {merged['retention_days']} would unfollow the previous period's "
+                        f"playlist at once; set it to at least {2 * merged['period_days']} in the same call"
+                    )
+            if "position_rules" in changes:
+                changes["position_rules"] = self._validate_position_rules(
+                    merged, rotation, changes["position_rules"]
+                )
+                merged["position_rules"] = changes["position_rules"]
+            elif merged.get("position_rules") and {"movements", "track_count"} & set(changes):
+                # the shape changed under existing rules: they must still fit it
+                self._validate_position_rules(merged, rotation, merged["position_rules"])
+            too_far = [
+                r
+                for r in merged.get("position_rules") or []
+                if r["position"] > merged["track_count"]
+            ]
+            if too_far:
+                raise ToolError(
+                    f"position rule at slot {too_far[0]['position']} is beyond track_count "
+                    f"{merged['track_count']}; change position_rules too"
+                )
             if changes:
                 stored = self._store.get_config(rotation) or {}
                 stored.update(changes)

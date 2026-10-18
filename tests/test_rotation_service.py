@@ -74,6 +74,8 @@ class FakeClient:
 
     async def playlist_items(self, playlist_id, limit=50, offset=0, market=None):
         self.calls.append(("playlist_items", playlist_id, offset))
+        if playlist_id not in self.playlists:
+            raise ToolError(f"Not found (404): {playlist_id}")
         items = [
             {"added_at": "2026-06-02T08:22:40Z", "item": t}
             for t in self.playlists[playlist_id]["items"]
@@ -213,6 +215,7 @@ def test_norm_key_and_engine_config():
         "size": 24,
         "movements": 4,
         "per_movement": 6,
+        "period_days": 1,
         "cap_3_4": 4,
         "cap_3_5": 12,
         "min_fresh": 5,
@@ -589,3 +592,149 @@ def test_position_rules_and_date_format(svc):
         "position_rules"
         not in run(service.generate("candlelight", "2026-12-01", dry_run=True))["rule_report"]
     )
+
+
+def add_wehmut(client, n=69):
+    """A 69-track owned playlist with a wide artist spread, only in the catalog on demand."""
+    items = [track(2000 + i, f"W-Artist {i % 23}", f"Wehmut {i}") for i in range(1, n + 1)]
+    client.playlists["wehmut"] = {
+        "name": "4 Collection - Deutsche Wehmut",
+        "owner_id": ME,
+        "items": items,
+    }
+    client.catalog.update({t["id"]: t for t in items})
+
+
+def test_seed_spreads_movements_evenly(svc):
+    service, client, _ = svc
+    add_wehmut(client)
+    res = run(service.seed("wehmut", ["wehmut"]))
+    assert res["imported"] == 69 and res["by_movement"] == {1: 18, 2: 17, 3: 17, 4: 17}
+    run(service.config("wehmut", movements=1))
+    with pytest.raises(ToolError, match="pass confirm='wehmut'"):
+        run(service.seed("wehmut", ["wehmut"], reset=True))
+    with pytest.raises(ToolError, match="Not found"):
+        run(service.seed("wehmut", ["wehmut", "nope"], reset=True, confirm="wehmut"))
+    assert run(service.status("wehmut"))["pool"]["active"] == 69  # nothing was wiped
+    res = run(service.seed("wehmut", ["wehmut"], reset=True, confirm="wehmut"))
+    assert res["reset"]["pool"] == 69 and res["by_movement"] == {1: 69} and res["snapshot"] is None
+    with pytest.raises(ToolError, match="rotation must be"):
+        run(service.seed("Bad Name!", ["wehmut"]))
+    with pytest.raises(ToolError, match="at least one playlist"):
+        run(service.seed("wehmut", []))
+
+
+def test_weekly_single_movement_rotation(svc):
+    service, client, clock = svc
+    add_wehmut(client)
+    run(service.seed("wehmut", ["wehmut"]))
+    with pytest.raises(ToolError, match="must equal track_count"):
+        run(service.config("wehmut", track_count=12))
+    cfg = run(
+        service.config(
+            "wehmut",
+            track_count=12,
+            movements=1,
+            period_days=7,
+            retention_days=21,
+            pool_floor=1,
+            name_template="Wehmut {dd}.{mm}.",
+            new_song_daily_until="2020-01-01",
+        )
+    )["config"]
+    assert cfg["per_movement"] == 12 and cfg["period_days"] == 7
+    weeks = []
+    for _ in range(4):
+        res = run(service.generate("wehmut"))
+        weeks.append({t["uri"] for t in res["tracks"]})
+        assert len(res["tracks"]) == 12 and {t["movement"] for t in res["tracks"]} == {1}
+        assert res["rule_report"]["period_days"] == 7 and res["rule_report"]["R1_gap_1_2"] == 0
+        clock.advance(7)
+    assert not (weeks[0] & weeks[1]) and not (weeks[1] & weeks[2]) and not (weeks[0] & weeks[2])
+    gaps = {t["gap"] for t in run(service.generate("wehmut", dry_run=True))["tracks"] if t["gap"]}
+    assert gaps <= {3, 4}  # week-1 tracks are 3-4 periods old by now, never 1 or 2
+    assert run(service.history("wehmut", days=60))[0]["playlist_name"].startswith("Wehmut ")
+    # retention counts days: after four weekly runs with 21 days retention, week 1 is gone
+    assert client.names("unfollow_playlist") == [("unfollow_playlist", "PL1")]
+
+
+def test_pool_update_delete_and_reset(svc):
+    service, client, _ = svc
+    with pytest.raises(ToolError, match="movement must be"):
+        run(service.pool_update("candlelight", "t001", movement=9))
+    upd = run(
+        service.pool_update("candlelight", "spotify:track:t001", movement=3, note="deep heat now")
+    )
+    assert (
+        upd["changed"] == ["movement", "note"]
+        and upd["movement"] == 3
+        and upd["note"] == "deep heat now"
+    )
+    assert run(service.pool_update("candlelight", "t001"))["changed"] == []
+    with pytest.raises(ToolError, match="not in the candlelight pool"):
+        run(service.pool_update("candlelight", "t999", note="x"))
+    run(service.generate("candlelight"))
+    first = run(service.delete("candlelight"))
+    assert first["deleted"] is False and first["confirm"] == "candlelight:143:1"
+    with pytest.raises(ToolError, match="does not match"):
+        run(service.delete("candlelight", confirm="candlelight"))
+    with pytest.raises(ToolError, match="does not exist"):
+        run(service.delete("nope", confirm="nope:0:0"))
+    res = run(service.delete("candlelight", confirm=first["confirm"]))
+    assert res["deleted"] is True and res["rows"]["pool"] == 143 and res["rows"]["daily_runs"] == 1
+    assert client.daily() == ["PL1"]  # Spotify untouched
+    with pytest.raises(ToolError, match="rotation_seed"):
+        run(service.status("candlelight"))
+
+
+def test_retention_counts_days_and_keeps_newest(svc):
+    service, client, clock = svc
+    run(service.config("candlelight", retention_days=2))
+    run(service.generate("candlelight"))  # day 1
+    clock.advance(5)
+    run(service.generate("candlelight"))  # day 6: day 1 is older than 2 days
+    assert client.names("unfollow_playlist") == [("unfollow_playlist", "PL1")]
+    client.calls.clear()
+    clock.advance(5)
+    run(service.config("candlelight", retention_days=1))
+    run(service.generate("candlelight"))  # day 11
+    assert client.names("unfollow_playlist") == [("unfollow_playlist", "PL2")]
+    assert client.daily() == ["PL3"]
+
+
+def test_config_upper_bounds_and_shape_consistency(svc):
+    service, _, _ = svc
+    for field, value in (
+        ("retention_days", 10**7),
+        ("period_days", 400),
+        ("pool_floor", 10**6),
+        ("new_song_then_every_days", 400),
+    ):
+        with pytest.raises(ToolError, match="at most"):
+            run(service.config("candlelight", **{field: value}))
+    with pytest.raises(ToolError, match="retention_days 7 would unfollow"):
+        run(service.config("candlelight", period_days=7))
+    run(
+        service.config(
+            "candlelight",
+            position_rules=[{"position": "first", "artist": "Sade", "movements": [1, 2]}],
+        )
+    )
+    with pytest.raises(ToolError, match="movements must be"):
+        run(service.config("candlelight", movements=1))  # the rule still names movement 2
+    run(service.config("candlelight", position_rules=[]))
+    assert run(service.config("candlelight", movements=1))["config"]["per_movement"] == 24
+
+
+def test_snapshot_before_destructive_ops(tmp_path):
+    client = catalog()
+    service = RotationService(Store(str(tmp_path / "r.db")), client, now=Clock(START))
+    run(service.seed("candlelight", VOLS))
+    res = run(service.seed("candlelight", ["vol1"], reset=True, confirm="candlelight"))
+    assert res["snapshot"] and res["snapshot"].endswith(".reset.bak.db")
+    assert (tmp_path / res["snapshot"].rsplit("/", 1)[1]).stat().st_mode & 0o777 == 0o600
+    assert run(service.status("candlelight"))["pool"]["active"] == 24
+    token = run(service.delete("candlelight"))["confirm"]
+    gone = run(service.delete("candlelight", confirm=token))
+    assert gone["snapshot"].endswith(".delete.bak.db")
+    assert len(list(tmp_path.glob("*.bak.db"))) == 2
