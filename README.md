@@ -172,6 +172,18 @@ Use only these tools: me, search, library_check, rotation_status, rotation_pool_
    scripts/up.sh                            # warms gpg-agent, starts both
    ```
 
+## On the VPS since the 2026-10-19 cutover
+
+The server runs as the system user `spotify` from a root-owned release (`/opt/spotify-mcp/current`,
+built by `uv sync --frozen --no-dev` on the VPS's `/usr/bin/python3`), listens on the unix socket
+`/run/spotify-mcp/server.sock`, and its units are the *system* units `spotify-mcp.socket`,
+`spotify-mcp.service` and `spotify-tunnel.service`, kept in `1201-assistant/systemd/system/`
+(`access-boundaries` design, step 1b). Secrets are systemd credentials. Deploy = merge to `main`,
+then `sudo svc-deploy spotify-mcp <40-hex commit hash>` inside an open window; back with
+`sudo svc-deploy rollback spotify-mcp`. A system Python change (Ubuntu 26.04 moved it to 3.14 on
+2026-10-19) empties the venv — redeploy; the current hash is refused, so it takes a new commit.
+Steps 3–4 above and "Day-to-day" below describe the pre-cutover `systemd --user` install.
+
 ## Day-to-day
 
 - `scripts/up.sh` — warm gpg-agent + (re)start both services. **Run this after a reboot** (a cold
