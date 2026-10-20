@@ -18,18 +18,49 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 
-TABLES = (("rotations", "id"), ("pool", "rotation_id"), ("daily_runs", "rotation_id"), ("daily_tracks", "rotation_id"))
+TABLES = (
+    ("rotations", "id"),
+    ("pool", "rotation_id"),
+    ("daily_runs", "rotation_id"),
+    ("daily_tracks", "rotation_id"),
+)
+
+
+def fold_wal(src: str, workdir: str) -> str:
+    """A source that still carries a `-wal` (and `-shm`) next to it cannot be attached read-only from
+    a directory we cannot write: copy the set into a scratch directory beside the target, open the
+    copy once (that replays the WAL) and fold it into a single file. Returns the path to attach."""
+    if not os.path.exists(src + "-wal"):
+        return src
+    work = tempfile.mkdtemp(prefix="rotation-merge-", dir=workdir)
+    os.chmod(work, 0o700)
+    folded = os.path.join(work, "source.db")
+    shutil.copy2(src, folded)
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(src + suffix):
+            shutil.copy2(src + suffix, folded + suffix)
+    c = sqlite3.connect(folded)
+    c.execute("PRAGMA journal_mode=DELETE")  # replays and drops the WAL: one self-contained file
+    c.close()
+    print("source WAL folded into", folded)
+    return folded
 
 
 def describe(conn: sqlite3.Connection, label: str, schema: str = "main") -> None:
     print(label)
     for (rid,) in conn.execute(f"SELECT id FROM {schema}.rotations ORDER BY id"):
-        pool = conn.execute(f"SELECT count(*) FROM {schema}.pool WHERE rotation_id=? AND active=1", (rid,)).fetchone()[0]
+        pool = conn.execute(
+            f"SELECT count(*) FROM {schema}.pool WHERE rotation_id=? AND active=1", (rid,)
+        ).fetchone()[0]
         runs = conn.execute(
-            f"SELECT count(*), min(run_date), max(run_date) FROM {schema}.daily_runs WHERE rotation_id=?", (rid,)
+            f"SELECT count(*), min(run_date), max(run_date) FROM {schema}.daily_runs WHERE rotation_id=?",
+            (rid,),
         ).fetchone()
         print(f"  {rid}: {pool} active songs, {runs[0]} runs {runs[1] or '-'}..{runs[2] or '-'}")
 
@@ -44,8 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     rid = a.rotation
 
-    into = sqlite3.connect(a.dst)
-    into.execute("ATTACH DATABASE ? AS src", (a.src,))
+    src_path = fold_wal(a.src, os.path.dirname(os.path.abspath(a.dst)))
+    into = sqlite3.connect(
+        f"file:{a.dst}?mode=rw", uri=True
+    )  # never create: a missing target is an error
+    into.execute("ATTACH DATABASE ? AS src", (f"file:{src_path}?mode=ro",))
     describe(into, f"source {a.src}", "src")
     describe(into, f"target {a.dst}", "main")
     if into.execute("SELECT 1 FROM src.rotations WHERE id=?", (rid,)).fetchone() is None:
@@ -62,11 +96,15 @@ def main(argv: list[str] | None = None) -> int:
     oldest = into.execute("SELECT min(run_date) FROM src.daily_runs").fetchone()[0] or "0000"
     into.execute("BEGIN IMMEDIATE")
     try:
-        into.execute("CREATE TEMP TABLE keep AS SELECT * FROM main.pool WHERE rotation_id=?", (rid,))
+        into.execute(
+            "CREATE TEMP TABLE keep AS SELECT * FROM main.pool WHERE rotation_id=?", (rid,)
+        )
         for table, col in TABLES + (("pool_events", "rotation_id"),):
             into.execute(f"DELETE FROM main.{table} WHERE {col}=?", (rid,))
         for table, col in TABLES:
-            into.execute(f"INSERT INTO main.{table} SELECT * FROM src.{table} WHERE {col}=?", (rid,))
+            into.execute(
+                f"INSERT INTO main.{table} SELECT * FROM src.{table} WHERE {col}=?", (rid,)
+            )
         into.execute(
             "INSERT INTO main.pool_events (rotation_id, track_id, event, at, actor, reason) "
             "SELECT rotation_id, track_id, event, at, actor, reason FROM src.pool_events WHERE rotation_id=?",
@@ -75,7 +113,10 @@ def main(argv: list[str] | None = None) -> int:
         kept = into.execute("INSERT OR IGNORE INTO main.pool SELECT * FROM keep").rowcount
         if a.fill_others:
             for table in ("pool", "daily_runs", "daily_tracks"):
-                into.execute(f"INSERT OR IGNORE INTO main.{table} SELECT * FROM src.{table} WHERE rotation_id<>?", (rid,))
+                into.execute(
+                    f"INSERT OR IGNORE INTO main.{table} SELECT * FROM src.{table} WHERE rotation_id<>?",
+                    (rid,),
+                )
             into.execute(
                 "INSERT INTO main.pool_events (rotation_id, track_id, event, at, actor, reason) "
                 "SELECT rotation_id, track_id, event, at, actor, reason FROM src.pool_events "
