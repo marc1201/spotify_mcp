@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,18 @@ def _now() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat()
 
 
+def file_mode(path: str | Path) -> int:
+    """0o660 when the database directory is group-shared (setgid, as the VPS data root is since the
+    window runner may act in the service's group), else 0o600: listening history is private either
+    way — never world-readable. -wal/-shm inherit the database's mode."""
+    parent = Path(path).parent
+    try:
+        shared = bool(parent.stat().st_mode & stat.S_ISGID)
+    except OSError:
+        shared = False
+    return 0o660 if shared else 0o600
+
+
 class Store:
     def __init__(self, path: str = ":memory:"):
         self._path = path
@@ -104,7 +117,7 @@ class Store:
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         if path != ":memory:":
-            os.chmod(path, 0o600)  # listening history is private; -wal/-shm inherit this mode
+            os.chmod(path, file_mode(path))
             self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
 
@@ -117,7 +130,7 @@ class Store:
         stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
         dest = src.with_name(f"{src.stem}.{stamp}.{label}.bak.db")
         self._db.execute("VACUUM INTO ?", (str(dest),))
-        os.chmod(dest, 0o600)
+        os.chmod(dest, file_mode(dest))
         return str(dest)
 
     def get_config(self, rotation_id: str) -> dict[str, Any] | None:

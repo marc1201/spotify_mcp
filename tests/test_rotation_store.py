@@ -156,3 +156,23 @@ def test_library_index_matches_by_id_isrc_or_title():
     assert s.library_matches("zz", None, "zz") == []
     s.replace_library_index([])
     assert s.library_matches("a", None, "zz") == []
+
+
+def test_database_mode_follows_the_directory(tmp_path):
+    """0600 in a private directory; 0660 when the directory is group-shared (setgid), so the
+    window runner acting in the service's group can repair the file (VPS data root)."""
+    import os
+    import stat
+
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    Store(str(private / "rotation.db")).snapshot("t")
+    modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in private.iterdir() if p.suffix == ".db"}
+    assert modes and set(modes.values()) == {0o600}
+
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o770)
+    os.chmod(shared, 0o2770)
+    Store(str(shared / "rotation.db")).snapshot("t")
+    modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in shared.iterdir() if p.suffix == ".db"}
+    assert modes and set(modes.values()) == {0o660}
