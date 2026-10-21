@@ -17,6 +17,7 @@ Written 2026-10-20 for the Wehmut recovery after a WAL-less copy at the VPS cuto
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime as dt
 import os
 import shutil
@@ -35,11 +36,13 @@ TABLES = (
 def fold_wal(src: str, workdir: str) -> str:
     """A source that still carries a `-wal` (and `-shm`) next to it cannot be attached read-only from
     a directory we cannot write: copy the set into a scratch directory beside the target, open the
-    copy once (that replays the WAL) and fold it into a single file. Returns the path to attach."""
+    copy once (that replays the WAL) and fold it into a single file. Returns the path to attach;
+    the scratch directory is removed when the process exits."""
     if not os.path.exists(src + "-wal"):
         return src
     work = tempfile.mkdtemp(prefix="rotation-merge-", dir=workdir)
     os.chmod(work, 0o700)
+    atexit.register(shutil.rmtree, work, ignore_errors=True)  # gone when the process exits
     folded = os.path.join(work, "source.db")
     shutil.copy2(src, folded)
     for suffix in ("-wal", "-shm"):
